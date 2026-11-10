@@ -1437,6 +1437,70 @@ async def test_structured_output(gemini_client, model, messages, model_id, weath
     gemini_client.aio.models.generate_content.assert_called_with(**exp_request)
 
 
+@pytest.mark.asyncio
+async def test_structured_output_throttled_exception(gemini_client, model, messages, weather_output):
+    """Regression test for https://github.com/strands-agents/harness-sdk/issues/5980.
+
+    A 429 from generate_content raises ModelThrottledException, same as stream().
+    """
+    gemini_client.aio.models.generate_content.side_effect = genai.errors.ClientError(
+        429, {"error": {"status": "RESOURCE_EXHAUSTED", "message": "Resource exhausted. Please try again later."}}
+    )
+
+    with pytest.raises(ModelThrottledException, match="Resource exhausted. Please try again later."):
+        await anext(model.structured_output(type(weather_output), messages))
+
+
+@pytest.mark.asyncio
+async def test_structured_output_throttled_exception_non_json_body(gemini_client, model, messages, weather_output):
+    """Regression test for https://github.com/strands-agents/harness-sdk/issues/5980.
+
+    A 429 whose body is not JSON still raises ModelThrottledException. google-genai sets status to the HTTP
+    reason phrase, so the status is not RESOURCE_EXHAUSTED and the HTTP code is the throttling signal.
+    """
+    body = '{"error": {"code": 429, "status": "RESOURCE_EXHAUSTED"}}'
+    gemini_client.aio.models.generate_content.side_effect = genai.errors.ClientError(
+        429, {"message": body, "status": "Too Many Requests"}
+    )
+
+    with pytest.raises(ModelThrottledException, match="RESOURCE_EXHAUSTED"):
+        await anext(model.structured_output(type(weather_output), messages))
+
+
+@pytest.mark.asyncio
+async def test_structured_output_unavailable_exception(gemini_client, model, messages, weather_output):
+    """Regression test for https://github.com/strands-agents/harness-sdk/issues/5980.
+
+    A client error whose status is UNAVAILABLE raises ModelThrottledException, same as stream().
+    """
+    gemini_client.aio.models.generate_content.side_effect = genai.errors.ClientError(
+        400, {"error": {"status": "UNAVAILABLE", "message": "The model is overloaded. Please try again later."}}
+    )
+
+    with pytest.raises(ModelThrottledException, match="The model is overloaded. Please try again later."):
+        await anext(model.structured_output(type(weather_output), messages))
+
+
+@pytest.mark.asyncio
+async def test_structured_output_context_overflow_exception(gemini_client, model, messages, weather_output):
+    """Regression test for https://github.com/strands-agents/harness-sdk/issues/5980.
+
+    An INVALID_ARGUMENT that exceeds the token limit raises ContextWindowOverflowException, same as stream().
+    """
+    gemini_client.aio.models.generate_content.side_effect = genai.errors.ClientError(
+        400,
+        {
+            "error": {
+                "message": "request exceeds the maximum number of tokens (100)",
+                "status": "INVALID_ARGUMENT",
+            },
+        },
+    )
+
+    with pytest.raises(ContextWindowOverflowException, match="exceeds the maximum number of tokens"):
+        await anext(model.structured_output(type(weather_output), messages))
+
+
 def test_gemini_tools_validation_rejects_function_declarations(model_id):
     tool_with_function_declarations = genai.types.Tool(
         function_declarations=[

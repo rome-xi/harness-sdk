@@ -11,7 +11,7 @@ import os
 import secrets
 from collections import Counter
 from collections.abc import AsyncGenerator, Mapping
-from typing import Any, TypeVar, cast
+from typing import Any, NoReturn, TypeVar, cast
 
 import pydantic
 from google import genai
@@ -66,6 +66,22 @@ def _tool_result_media(item: ToolResultContent) -> tuple[ImageContent | Document
         document = item["document"]
         return document, document.get("name") or f"document.{document['format']}"
     raise TypeError(f"content_type=<{next(iter(item))}> | unsupported type")
+
+
+def _raise_mapped_client_error(error: genai.errors.ClientError) -> NoReturn:
+    # When the response body is not JSON, google-genai sets status to the HTTP reason
+    # phrase ("Too Many Requests"), so the HTTP code is the reliable throttling signal.
+    if error.code == 429:
+        raise ModelThrottledException(error.message or str(error)) from error
+    match error.status:
+        case "RESOURCE_EXHAUSTED" | "UNAVAILABLE":
+            raise ModelThrottledException(error.message or str(error)) from error
+        case "INVALID_ARGUMENT":
+            if error.message and "exceeds the maximum number of tokens" in error.message:
+                raise ContextWindowOverflowException(error.message) from error
+            raise error
+        case _:
+            raise error
 
 
 class GeminiModel(Model):
@@ -705,6 +721,7 @@ class GeminiModel(Model):
 
         Raises:
             ModelThrottledException: If the request is throttled by Gemini.
+            ContextWindowOverflowException: If the request exceeds the model's context window.
         """
         request = self._format_request(
             messages, tool_specs, system_prompt, self.config.get("params"), tool_choice=tool_choice
@@ -797,19 +814,7 @@ class GeminiModel(Model):
                 yield self._format_chunk({"chunk_type": "metadata", "data": event.usage_metadata})
 
         except genai.errors.ClientError as error:
-            # When the response body is not JSON, google-genai sets status to the HTTP reason
-            # phrase ("Too Many Requests"), so the HTTP code is the reliable throttling signal.
-            if error.code == 429:
-                raise ModelThrottledException(error.message or str(error)) from error
-            match error.status:
-                case "RESOURCE_EXHAUSTED" | "UNAVAILABLE":
-                    raise ModelThrottledException(error.message or str(error)) from error
-                case "INVALID_ARGUMENT":
-                    if error.message and "exceeds the maximum number of tokens" in error.message:
-                        raise ContextWindowOverflowException(error.message) from error
-                    raise error
-                case _:
-                    raise error
+            _raise_mapped_client_error(error)
 
     @override
     async def structured_output(
@@ -827,6 +832,10 @@ class GeminiModel(Model):
 
         Yields:
             Model events with the last being the structured output.
+
+        Raises:
+            ModelThrottledException: If the request is throttled by Gemini.
+            ContextWindowOverflowException: If the request exceeds the model's context window.
         """
         params = {
             **(self.config.get("params") or {}),
@@ -835,7 +844,10 @@ class GeminiModel(Model):
         }
         request = self._format_request(prompt, None, system_prompt, params)
         client = self._get_client().aio
-        response = await client.models.generate_content(**request)
+        try:
+            response = await client.models.generate_content(**request)
+        except genai.errors.ClientError as error:
+            _raise_mapped_client_error(error)
         yield {"output": output_model.model_validate(response.parsed)}
 
     @staticmethod
